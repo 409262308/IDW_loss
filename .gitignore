@@ -219,3 +219,4 @@ __marimo__/
 
 #avoid by myself
 *.zip
+*.npy
