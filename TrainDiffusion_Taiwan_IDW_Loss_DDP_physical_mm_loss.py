@@ -428,7 +428,7 @@ def training_step(model, loss_fn, optimiser, data_loader, scaler, epoch, accum, 
             coarse = batch["coarse"].to(device, non_blocking=True)
             valid_mask = batch["valid_mask"].to(device, non_blocking=True)
             condition_params = torch.stack(
-                (batch["doy"].to(device, non_blocking=True), batch["hour"].to(device, non_blocking=True)),
+                (batch["year"].to(device, non_blocking=True), batch["doy"].to(device, non_blocking=True)),
                 dim=1,
             )
 
@@ -498,7 +498,7 @@ def validation_step(model, loss_fn, data_loader, epoch, device, stats):
             coarse = batch["coarse"].to(device, non_blocking=True)
             valid_mask = batch["valid_mask"].to(device, non_blocking=True)
             condition_params = torch.stack(
-                (batch["doy"].to(device, non_blocking=True), batch["hour"].to(device, non_blocking=True)),
+                (batch["year"].to(device, non_blocking=True), batch["doy"].to(device, non_blocking=True)),
                 dim=1,
             )
 
@@ -534,7 +534,7 @@ def sample_model(model, dataloader, num_steps, sigma_min, sigma_max, rho, S_chur
     fine = batch["fine"]
 
     condition_params = torch.stack(
-        (batch["doy"].to(device), batch["hour"].to(device)),
+        (batch["year"].to(device), batch["doy"].to(device)),
         dim=1,
     )
 
@@ -714,6 +714,32 @@ def main():
         dist.barrier()
 
     stats = load_stats(stats_path)
+    expected_spatial_mask = "full_grid" if args.no_mask else "land"
+    if stats.get("spatial_mask") != expected_spatial_mask:
+        raise ValueError(
+            f"Stats spatial_mask={stats.get('spatial_mask')!r}, expected "
+            f"{expected_spatial_mask!r}. Re-run with --recompute-stats."
+        )
+    if stats.get("resolution") != args.resolution:
+        raise ValueError(
+            f"Stats resolution={stats.get('resolution')!r}, expected {args.resolution!r}. "
+            "Re-run with --recompute-stats."
+        )
+    if stats.get("target_transform") != args.target_transform:
+        raise ValueError(
+            f"Stats target_transform={stats.get('target_transform')!r}, expected "
+            f"{args.target_transform!r}. Re-run with --recompute-stats."
+        )
+    if int(stats.get("tp_idw_k", -1)) != args.tp_idw_k or not math.isclose(
+        float(stats.get("tp_idw_power", float("nan"))),
+        args.tp_idw_power,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(
+            "Stats IDW settings do not match --tp-idw-k/--tp-idw-power. "
+            "Re-run with --recompute-stats."
+        )
 
     dataset_train = TaiwanERAPrecipDataset(
         data_dir=args.data_dir,
@@ -760,6 +786,10 @@ def main():
     print0(f"[Dataset] train={len(dataset_train)} val={len(dataset_val)}")
     print0(f"[Dataset] input channels={dataset_train.num_input_channels} names={dataset_train.input_channel_names}")
     print0(f"[Dataset] target channels={dataset_train.target_channels}")
+    print0(
+        f"[Dataset] spatial_mask={stats['spatial_mask']} "
+        f"valid_pixels={int(dataset_train.valid_mask.sum().item())}"
+    )
     print0(f"[Batch] per_gpu={args.batch_size} world_size={get_world_size()} accum={args.accum} effective={args.batch_size * get_world_size() * args.accum}")
 
     model_in_channels = dataset_train.num_input_channels + dataset_train.target_channels
@@ -813,6 +843,8 @@ def main():
         "model_in_channels": model_in_channels,
         "model_out_channels": model_out_channels,
         "img_resolution": dataset_train.img_resolution,
+        "label_features": ["year", "doy"],
+        "network_conditioning": "unscaled_condition_v1",
         "stats_path": str(stats_path),
         "world_size": get_world_size(),
         "effective_batch": args.batch_size * get_world_size() * args.accum,

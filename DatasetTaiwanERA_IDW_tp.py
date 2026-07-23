@@ -225,8 +225,8 @@ class TaiwanERAPrecipDataset(torch.utils.data.Dataset):
         if not self.dates:
             raise ValueError("No dates found for the requested range.")
 
-        self.valid_mask = self._build_valid_mask()
         self.static_mask = self._load_static_mask() if use_mask else None
+        self.valid_mask = self._build_valid_mask()
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -307,14 +307,25 @@ class TaiwanERAPrecipDataset(torch.utils.data.Dataset):
         return as_hw_tensor(array, self.target_shape)
 
     def _build_valid_mask(self):
+        # For Taiwan precipitation, train and evaluate only where the static
+        # land mask is valid.  This prevents the nearly-always-zero ocean area
+        # from dominating loss/MAE/CRPS.  --no-mask keeps the legacy full-grid
+        # behaviour.
+        if self.static_mask is not None:
+            return self.static_mask.unsqueeze(0)
         mask = torch.ones(self.target_shape, dtype=torch.float32)
         return pad_hw(mask, self.padded_shape).unsqueeze(0)
 
     def _load_static_mask(self):
         mask_path = self.data_dir / "mask_sd5km.npy"
+        if not mask_path.exists():
+            raise FileNotFoundError(f"Static mask not found: {mask_path}")
         mask = torch.from_numpy(np.load(mask_path, allow_pickle=False)).float()
+        if mask.ndim != 2:
+            raise ValueError(f"Static mask must be 2D, got shape {tuple(mask.shape)}.")
         if tuple(mask.shape) != self.target_shape:
             mask = resize_2d(mask, self.target_shape, mode="nearest")
+        mask = (mask > 0.5).to(torch.float32)
         return pad_hw(mask, self.padded_shape)
 
     def _normalize_input_channel(self, name, tensor):
@@ -465,6 +476,7 @@ def compute_stats(dataset, max_samples=2048):
     return {
         "resolution": dataset.resolution,
         "target_transform": dataset.target_transform,
+        "spatial_mask": "land" if dataset.use_mask else "full_grid",
         "tp_resize": "idw",
         "tp_idw_k": dataset.tp_idw_k,
         "tp_idw_power": dataset.tp_idw_power,

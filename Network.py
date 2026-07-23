@@ -364,21 +364,42 @@ class EDMPrecond(torch.nn.Module):
             out_channels=out_channels, label_dim=label_dim, **model_kwargs)
 
     def forward(self, x, sigma, condition_img=None, class_labels=None,
-                force_fp32=True, **model_kwargs):
-        if condition_img is not None:
-            in_img = torch.cat([x, condition_img], dim=1)
-        else:
-            in_img = x
+                force_fp32=False, **model_kwargs):
         sigma = sigma.reshape(-1, 1, 1, 1)
-        class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=in_img.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
-        dtype = torch.float16 if (self.use_fp16 and not force_fp32 and in_img.device.type == 'cuda') else torch.float32
+        class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
+        dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
         c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
         c_noise = sigma.log() / 4
 
-        F_x = self.model((c_in * in_img).to(dtype),
+        # EDM preconditioning belongs to the noisy diffusion state only.
+        # Condition fields have already been normalized by the dataset; scaling
+        # them by c_in would make meteorology and the land mask vanish at large
+        # sigma during the early sampling steps.
+        noisy_input = c_in * x
+        if condition_img is not None:
+            if condition_img.ndim != x.ndim or condition_img.shape[0] != x.shape[0]:
+                raise ValueError(
+                    f"condition_img batch/rank mismatch: x={tuple(x.shape)}, "
+                    f"condition_img={tuple(condition_img.shape)}"
+                )
+            if condition_img.shape[2:] != x.shape[2:]:
+                raise ValueError(
+                    f"condition_img spatial mismatch: x={tuple(x.shape)}, "
+                    f"condition_img={tuple(condition_img.shape)}"
+                )
+            in_img = torch.cat([noisy_input, condition_img], dim=1)
+        else:
+            in_img = noisy_input
+        if in_img.shape[1] != self.in_channels:
+            raise ValueError(
+                f"EDMPrecond expected {self.in_channels} input channels, "
+                f"but received {in_img.shape[1]}."
+            )
+
+        F_x = self.model(in_img.to(dtype),
                          noise_labels=c_noise.flatten(),
                          class_labels=class_labels, **model_kwargs).to(dtype)
         assert F_x.dtype == dtype
