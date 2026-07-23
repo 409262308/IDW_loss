@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import importlib.util
 import json
 import random
@@ -52,7 +53,9 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from tqdm import tqdm
+from torch.utils.data import Sampler
 
 import Network
 
@@ -77,10 +80,104 @@ def _load_dataset_module():
 TaiwanERAPrecipDataset, load_stats = _load_dataset_module()
 
 
+def is_dist_avail_and_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank() -> int:
+    return dist.get_rank() if is_dist_avail_and_initialized() else 0
+
+
+def get_world_size() -> int:
+    return dist.get_world_size() if is_dist_avail_and_initialized() else 1
+
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+
+def print0(*args, **kwargs) -> None:
+    if is_main_process():
+        print(*args, **kwargs)
+
+
+def setup_distributed(args) -> torch.device:
+    """Initialize torch.distributed when launched by torchrun."""
+    args.distributed = ("RANK" in os.environ and "WORLD_SIZE" in os.environ)
+    args.rank = int(os.environ.get("RANK", 0))
+    args.world_size = int(os.environ.get("WORLD_SIZE", 1))
+    args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    if not args.distributed:
+        return choose_device(args.device)
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device("cuda", args.local_rank)
+        backend = "nccl"
+    else:
+        device = torch.device("cpu")
+        backend = "gloo"
+
+    dist.init_process_group(backend=backend, init_method="env://")
+    if device.type == "cuda":
+        dist.barrier(device_ids=[args.local_rank])
+    else:
+        dist.barrier()
+    return device
+
+
+def cleanup_distributed() -> None:
+    if is_dist_avail_and_initialized():
+        try:
+            if torch.cuda.is_available():
+                dist.barrier(device_ids=[torch.cuda.current_device()])
+            else:
+                dist.barrier()
+        finally:
+            dist.destroy_process_group()
+
+
 def parse_csv_list(value: Optional[str], cast=str) -> List:
     if value is None or value == "":
         return []
     return [cast(v.strip()) for v in value.split(",") if v.strip()]
+
+
+def parse_condition_vars(value):
+    """Return condition variable names from a list/tuple or comma-separated string."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [v.strip() for v in str(value).split(",") if v.strip()]
+
+
+def parse_int_list_config(value, default):
+    """Return list[int] from list/tuple, comma-separated string, or default."""
+    if value is None:
+        value = default
+    if isinstance(value, str):
+        return [int(v.strip()) for v in value.split(",") if v.strip()]
+    if isinstance(value, (list, tuple)):
+        return [int(v) for v in value]
+    return [int(value)]
+
+
+class DistributedEvalSampler(Sampler):
+    """Rank-strided evaluation sampler with no padded/duplicated examples."""
+
+    def __init__(self, dataset) -> None:
+        self.dataset = dataset
+        self.rank = get_rank()
+        self.world_size = get_world_size()
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self) -> int:
+        n = len(self.dataset) - self.rank
+        return max(0, (n + self.world_size - 1) // self.world_size)
 
 
 def choose_device(requested: str) -> torch.device:
@@ -231,12 +328,79 @@ def crps_ensemble_map(preds: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
     first = torch.mean(torch.abs(preds - truth.unsqueeze(0)), dim=0)
     if m == 1:
         return first
-    pair_sum = torch.zeros_like(first)
-    for i in range(m):
-        for j in range(m):
-            pair_sum += torch.abs(preds[i] - preds[j])
-    second = pair_sum / float(m * m)
-    return first - 0.5 * second
+    # For sorted x, 0.5 * mean_{i,j}|x_i-x_j| equals
+    # sum_i (2*i-m+1)*x_i / m^2.  This avoids M^2 full-image operations.
+    sorted_preds = torch.sort(preds, dim=0).values
+    coeff = (2 * torch.arange(m, dtype=preds.dtype, device=preds.device) - m + 1)
+    coeff = coeff.view(m, *([1] * (preds.ndim - 1)))
+    spread = (sorted_preds * coeff).sum(dim=0) / float(m * m)
+    return first - spread
+
+
+def apply_residual_scale(preds: torch.Tensor, coarse: torch.Tensor, scale: float) -> torch.Tensor:
+    """Shrink/expand the generated physical-mm correction around the IDW baseline."""
+    return (coarse.unsqueeze(0) + float(scale) * (preds - coarse.unsqueeze(0))).clamp_min(0)
+
+
+@torch.no_grad()
+def calibrate_residual_scale(
+    model, dataset, dataloader, args, candidates: List[float], device
+) -> Tuple[float, List[float], List[float]]:
+    """Choose correction scale by MAE and CRPS on validation data.
+
+    Scale zero is the exact coarse forecast, so including it makes the
+    calibration result no worse than coarse on the calibration subset.
+    """
+    abs_sums = torch.zeros(len(candidates), dtype=torch.float64, device=device)
+    crps_sums = torch.zeros(len(candidates), dtype=torch.float64, device=device)
+    pixel_count = torch.zeros(1, dtype=torch.float64, device=device)
+
+    for batch_index, batch in enumerate(tqdm(
+        dataloader,
+        desc=f"Calibrate rank {get_rank()}",
+        dynamic_ncols=True,
+        disable=not is_main_process(),
+    )):
+        fine = batch["fine"].float().cpu().clamp_min(0)
+        coarse = batch["coarse"].float().cpu().clamp_min(0)
+        mask = batch["valid_mask"].float().cpu()
+        members = []
+        for member in range(args.calibration_ensemble_members):
+            set_seed(args.seed + 900000000 + get_rank() * 10000000 + batch_index * 100000 + member)
+            members.append(sample_model_eds_batch(
+                batch, model, device, dataset,
+                num_steps=args.num_steps, sigma_min=args.sigma_min, sigma_max=args.sigma_max,
+                rho=args.rho, S_churn=args.S_churn, S_min=args.S_min,
+                S_max=args.S_max, S_noise=args.S_noise,
+            ))
+        raw_preds = torch.stack(members, dim=0)
+        count = mask.sum().double()
+        pixel_count += count.to(device)
+        for i, scale in enumerate(candidates):
+            calibrated_preds = apply_residual_scale(raw_preds, coarse, scale)
+            calibrated_mean = calibrated_preds.mean(dim=0)
+            abs_sums[i] += (torch.abs(calibrated_mean - fine) * mask).sum().double().to(device)
+            crps = crps_ensemble_map(calibrated_preds, fine)
+            crps_sums[i] += (crps * mask).sum().double().to(device)
+
+    if is_dist_avail_and_initialized():
+        dist.all_reduce(abs_sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(crps_sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(pixel_count, op=dist.ReduceOp.SUM)
+    maes = (abs_sums / pixel_count.clamp_min(1.0)).cpu().tolist()
+    crps_values = (crps_sums / pixel_count.clamp_min(1.0)).cpu().tolist()
+    zero_index = candidates.index(0.0)
+    tolerance = 1e-10
+    eligible = [
+        i for i in range(len(candidates))
+        if maes[i] <= maes[zero_index] + tolerance and crps_values[i] <= crps_values[zero_index] + tolerance
+    ]
+    best_index = min(eligible, key=lambda i: (maes[i], crps_values[i], abs(candidates[i])))
+    return (
+        float(candidates[best_index]),
+        [float(v) for v in maes],
+        [float(v) for v in crps_values],
+    )
 
 
 def metric_batch(coarse: torch.Tensor, fine: torch.Tensor, preds: torch.Tensor, valid_mask: torch.Tensor):
@@ -267,9 +431,11 @@ def metric_batch(coarse: torch.Tensor, fine: torch.Tensor, preds: torch.Tensor, 
         if scale > eps:
             coarse_mase = 1.0
             model_mase = float(model_mae[b].item()) / scale
+            mae_skill = 1.0 - model_mase
         else:
             coarse_mase = float("nan")
             model_mase = float("nan")
+            mae_skill = float("nan")
         rows.append({
             "coarse_mae": float(coarse_mae[b].item()),
             "coarse_crps": float(coarse_crps[b].item()),
@@ -277,6 +443,8 @@ def metric_batch(coarse: torch.Tensor, fine: torch.Tensor, preds: torch.Tensor, 
             "model_mae": float(model_mae[b].item()),
             "model_crps": float(model_crps[b].item()),
             "model_mase": model_mase,
+            "mae_improvement_mm": float(coarse_mae[b].item() - model_mae[b].item()),
+            "mae_skill": mae_skill,
             "n_valid_pixels": int(valid_mask[b].sum().item()),
         })
 
@@ -337,6 +505,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--S-min", type=float, default=0.0)
     parser.add_argument("--S-max", type=float, default=float("inf"))
     parser.add_argument("--S-noise", type=float, default=1.0)
+    parser.add_argument("--residual-scale", type=str, default="auto",
+                        help="Physical-mm correction scale, or 'auto' to tune it on validation data.")
+    parser.add_argument("--residual-scale-candidates", type=str,
+                        default="0,0.02,0.05,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,1.1,1.2")
+    parser.add_argument("--calibration-start", type=str, default=None)
+    parser.add_argument("--calibration-end", type=str, default=None)
+    parser.add_argument("--calibration-max-samples", type=int, default=256)
+    parser.add_argument("--calibration-ensemble-members", type=int, default=4)
 
     parser.add_argument("--output-csv", type=str, default="./precip_metrics_per_date.csv")
     parser.add_argument("--summary-csv", type=str, default="./precip_metrics_summary.csv")
@@ -345,10 +521,10 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_argparser().parse_args()
-    set_seed(args.seed)
 
     checkpoint_path = Path(args.checkpoint)
-    device = choose_device(args.device)
+    device = setup_distributed(args)
+    set_seed(args.seed + get_rank())
     state_dict, ckpt_config, ckpt_stats, epoch, val_loss = load_checkpoint(checkpoint_path, device)
     train_config = load_train_config(checkpoint_path, args.train_config)
     merged_config = dict(ckpt_config)
@@ -359,9 +535,14 @@ def main() -> None:
         raise ValueError("Please pass --data-dir, or provide train_config.json containing data_dir.")
 
     if args.condition_vars is not None:
-        condition_vars = parse_csv_list(args.condition_vars, str)
+        raw_condition_vars = args.condition_vars
     else:
-        condition_vars = merged_config.get("condition_vars", merged_config.get("input_channel_names", ["q700", "t2m", "u", "v", "msl", "tp"]))
+        raw_condition_vars = merged_config.get(
+            "condition_vars",
+            merged_config.get("input_channel_names", ["q700", "t2m", "u", "v", "msl", "tp"]),
+        )
+
+    condition_vars = parse_condition_vars(raw_condition_vars)
     condition_vars = [v for v in condition_vars if v != "mask"]
 
     no_mask = bool(args.no_mask)
@@ -387,18 +568,27 @@ def main() -> None:
         tp_idw_power=tp_idw_power,
     )
 
+    sampler = DistributedEvalSampler(dataset_test) if getattr(args, "distributed", False) else None
+
     dataloader = torch.utils.data.DataLoader(
         dataset_test,
         batch_size=args.batch_size,
         shuffle=False,
+        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
     )
 
     model_channels = args.model_channels if args.model_channels is not None else int(merged_config.get("model_channels", 64))
-    channel_mult = parse_csv_list(args.channel_mult, int) if args.channel_mult is not None else merged_config.get("channel_mult", [1, 2, 3, 4])
+    channel_mult = parse_int_list_config(
+        args.channel_mult if args.channel_mult is not None else merged_config.get("channel_mult", [1, 2, 3, 4]),
+        [1, 2, 3, 4],
+    )
     num_blocks = args.num_blocks if args.num_blocks is not None else int(merged_config.get("num_blocks", 2))
-    attn_resolutions = parse_csv_list(args.attn_resolutions, int) if args.attn_resolutions is not None else merged_config.get("attn_resolutions", [32, 16, 8])
+    attn_resolutions = parse_int_list_config(
+        args.attn_resolutions if args.attn_resolutions is not None else merged_config.get("attn_resolutions", [32, 16, 8]),
+        [32, 16, 8],
+    )
     dropout = args.dropout if args.dropout is not None else float(merged_config.get("dropout", 0.10))
     sigma_data = args.sigma_data if args.sigma_data is not None else float(merged_config.get("sigma_data", 1.0))
     use_fp16 = bool(args.use_fp16 or merged_config.get("use_fp16", False))
@@ -421,14 +611,70 @@ def main() -> None:
     model.load_state_dict(state_dict, strict=True)
     model.eval()
 
-    print(f"[Device] {device}")
-    print(f"[Checkpoint] {checkpoint_path}")
+    if args.ensemble_members < 1 or args.num_steps < 2:
+        raise ValueError("--ensemble-members must be >= 1 and --num-steps must be >= 2.")
+
+    if args.residual_scale.lower() == "auto":
+        calibration_start = args.calibration_start or merged_config.get("val_start")
+        calibration_end = args.calibration_end or merged_config.get("val_end")
+        if not calibration_start or not calibration_end:
+            raise ValueError(
+                "--residual-scale auto needs --calibration-start/--calibration-end, "
+                "or val_start/val_end in train_config.json."
+            )
+        if args.calibration_ensemble_members < 1:
+            raise ValueError("--calibration-ensemble-members must be >= 1.")
+        candidates = sorted(set(parse_csv_list(args.residual_scale_candidates, float) + [0.0]))
+        if any(scale < 0 for scale in candidates):
+            raise ValueError("--residual-scale-candidates cannot contain negative values.")
+        if not candidates:
+            raise ValueError("--residual-scale-candidates must contain at least one number.")
+        calibration_dataset = TaiwanERAPrecipDataset(
+            data_dir=data_dir,
+            resolution=args.resolution,
+            start_date=calibration_start,
+            end_date=calibration_end,
+            condition_vars=condition_vars,
+            use_mask=not no_mask,
+            target_transform=target_transform,
+            stats=stats,
+            max_samples=args.calibration_max_samples,
+            tp_idw_k=tp_idw_k,
+            tp_idw_power=tp_idw_power,
+        )
+        calibration_sampler = DistributedEvalSampler(calibration_dataset) if getattr(args, "distributed", False) else None
+        calibration_loader = torch.utils.data.DataLoader(
+            calibration_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            sampler=calibration_sampler,
+            num_workers=args.num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+        residual_scale, calibration_maes, calibration_crps = calibrate_residual_scale(
+            model, calibration_dataset, calibration_loader, args, candidates, device
+        )
+        if is_main_process():
+            print0("[Calibration] scale -> MAE/CRPS: " + ", ".join(
+                f"{scale:g}->{mae:.6f}/{crps:.6f}"
+                for scale, mae, crps in zip(candidates, calibration_maes, calibration_crps)
+            ))
+        calibration_dataset.close()
+    else:
+        residual_scale = float(args.residual_scale)
+        if residual_scale < 0:
+            raise ValueError("--residual-scale must be non-negative.")
+
+    print0(f"[Device] {device}")
+    print0(f"[Checkpoint] {checkpoint_path}")
     if epoch is not None:
-        print(f"[Checkpoint] epoch={epoch} val_loss={val_loss}")
-    print(f"[Dataset] test={len(dataset_test)} resolution={args.resolution}")
-    print(f"[Dataset] condition_vars={condition_vars}, use_mask={not no_mask}")
-    print(f"[Model] in_channels={model_in_channels}, out_channels={model_out_channels}")
-    print(f"[Inference] ensemble_members={args.ensemble_members}, num_steps={args.num_steps}")
+        print0(f"[Checkpoint] epoch={epoch} val_loss={val_loss}")
+    print0(f"[Dataset] test={len(dataset_test)} resolution={args.resolution}")
+    print0(f"[Dataset] condition_vars={condition_vars}, use_mask={not no_mask}")
+    print0(f"[Model] in_channels={model_in_channels}, out_channels={model_out_channels}")
+    print0(f"[Inference] distributed={getattr(args, 'distributed', False)} world_size={get_world_size()}")
+    print0(f"[Inference] ensemble_members={args.ensemble_members}, num_steps={args.num_steps}")
+    print0(f"[Inference] residual_scale={residual_scale:g}")
 
     per_date_rows = []
     total_pixels = 0.0
@@ -437,14 +683,14 @@ def main() -> None:
     total_model_abs = 0.0
     total_model_crps = 0.0
 
-    for batch_index, batch in enumerate(tqdm(dataloader, desc="Inference", dynamic_ncols=True)):
+    for batch_index, batch in enumerate(tqdm(dataloader, desc=f"Inference rank {get_rank()}", dynamic_ncols=True, disable=not is_main_process())):
         fine = batch["fine"].float().cpu().clamp_min(0)
         coarse = batch["coarse"].float().cpu().clamp_min(0)
         valid_mask = batch["valid_mask"].float().cpu()
 
         preds_members = []
         for member in range(args.ensemble_members):
-            set_seed(args.seed + batch_index * 100000 + member)
+            set_seed(args.seed + get_rank() * 10000000 + batch_index * 100000 + member)
             pred = sample_model_eds_batch(
                 batch=batch,
                 model=model,
@@ -461,6 +707,7 @@ def main() -> None:
             )
             preds_members.append(pred)
         preds = torch.stack(preds_members, dim=0)
+        preds = apply_residual_scale(preds, coarse, residual_scale)
 
         rows, totals = metric_batch(coarse, fine, preds, valid_mask)
         dates = batch["date"]
@@ -477,6 +724,9 @@ def main() -> None:
                 "model_mae": row["model_mae"],
                 "model_crps": row["model_crps"],
                 "model_mase": row["model_mase"],
+                "mae_improvement_mm": row["mae_improvement_mm"],
+                "mae_skill": row["mae_skill"],
+                "residual_scale": residual_scale,
                 "ensemble_members": args.ensemble_members,
                 "num_steps": args.num_steps,
             })
@@ -487,50 +737,118 @@ def main() -> None:
         total_model_abs += totals["model_abs_sum"]
         total_model_crps += totals["model_crps_sum"]
 
-    eps = 1e-12
-    coarse_mae_global = total_coarse_abs / max(total_pixels, eps)
-    coarse_crps_global = total_coarse_crps / max(total_pixels, eps)
-    model_mae_global = total_model_abs / max(total_pixels, eps)
-    model_crps_global = total_model_crps / max(total_pixels, eps)
-    coarse_mase_global = 1.0 if coarse_mae_global > eps else float("nan")
-    model_mase_global = model_mae_global / coarse_mae_global if coarse_mae_global > eps else float("nan")
+    output_csv_path = Path(args.output_csv)
+    summary_csv_path = Path(args.summary_csv)
+    part_dir = output_csv_path.parent / "_ddp_inference_parts"
 
-    summary_rows = [
-        {
-            "comparison": "coarse_vs_groundtruth",
-            "mae": coarse_mae_global,
-            "crps": coarse_crps_global,
-            "mase": coarse_mase_global,
-            "scale_mae": coarse_mae_global,
-            "n_dates": len(per_date_rows),
-            "n_valid_pixels_total": int(total_pixels),
-            "ensemble_members": 1,
-            "num_steps": 0,
-        },
-        {
-            "comparison": "prediction_vs_groundtruth",
-            "mae": model_mae_global,
-            "crps": model_crps_global,
-            "mase": model_mase_global,
-            "scale_mae": coarse_mae_global,
-            "n_dates": len(per_date_rows),
-            "n_valid_pixels_total": int(total_pixels),
-            "ensemble_members": args.ensemble_members,
-            "num_steps": args.num_steps,
-        },
-    ]
+    if is_main_process():
+        part_dir.mkdir(parents=True, exist_ok=True)
+    if is_dist_avail_and_initialized():
+        dist.barrier()
 
-    write_csv(Path(args.output_csv), per_date_rows, [
+    part_csv = part_dir / f"per_date_rank{get_rank()}.csv"
+    part_json = part_dir / f"totals_rank{get_rank()}.json"
+
+    write_csv(part_csv, per_date_rows, [
         "date", "n_valid_pixels", "coarse_mae", "coarse_crps", "coarse_mase",
-        "model_mae", "model_crps", "model_mase", "ensemble_members", "num_steps",
+        "model_mae", "model_crps", "model_mase", "mae_improvement_mm", "mae_skill",
+        "residual_scale", "ensemble_members", "num_steps",
     ])
-    write_csv(Path(args.summary_csv), summary_rows, [
-        "comparison", "mae", "crps", "mase", "scale_mae", "n_dates",
-        "n_valid_pixels_total", "ensemble_members", "num_steps",
-    ])
+    part_json.write_text(json.dumps({
+        "n_pixels": total_pixels,
+        "coarse_abs_sum": total_coarse_abs,
+        "coarse_crps_sum": total_coarse_crps,
+        "model_abs_sum": total_model_abs,
+        "model_crps_sum": total_model_crps,
+    }, indent=2), encoding="utf-8")
 
-    print(f"[Saved] per-date metrics: {args.output_csv}")
-    print(f"[Saved] summary metrics:  {args.summary_csv}")
+    if is_dist_avail_and_initialized():
+        dist.barrier()
+
+    if is_main_process():
+        merged_rows = []
+        total_pixels_all = 0.0
+        total_coarse_abs_all = 0.0
+        total_coarse_crps_all = 0.0
+        total_model_abs_all = 0.0
+        total_model_crps_all = 0.0
+
+        for rank in range(get_world_size()):
+            rank_csv = part_dir / f"per_date_rank{rank}.csv"
+            rank_json = part_dir / f"totals_rank{rank}.json"
+
+            if rank_csv.exists():
+                with rank_csv.open("r", newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    merged_rows.extend(list(reader))
+
+            totals = json.loads(rank_json.read_text(encoding="utf-8"))
+            total_pixels_all += float(totals["n_pixels"])
+            total_coarse_abs_all += float(totals["coarse_abs_sum"])
+            total_coarse_crps_all += float(totals["coarse_crps_sum"])
+            total_model_abs_all += float(totals["model_abs_sum"])
+            total_model_crps_all += float(totals["model_crps_sum"])
+
+        merged_rows.sort(key=lambda row: row["date"])
+
+        eps = 1e-12
+        coarse_mae_global = total_coarse_abs_all / max(total_pixels_all, eps)
+        coarse_crps_global = total_coarse_crps_all / max(total_pixels_all, eps)
+        model_mae_global = total_model_abs_all / max(total_pixels_all, eps)
+        model_crps_global = total_model_crps_all / max(total_pixels_all, eps)
+        coarse_mase_global = 1.0 if coarse_mae_global > eps else float("nan")
+        model_mase_global = model_mae_global / coarse_mae_global if coarse_mae_global > eps else float("nan")
+        model_mae_skill_global = 1.0 - model_mase_global if coarse_mae_global > eps else float("nan")
+
+        summary_rows = [
+            {
+                "comparison": "coarse_vs_groundtruth",
+                "mae": coarse_mae_global,
+                "crps": coarse_crps_global,
+                "mase": coarse_mase_global,
+                "scale_mae": coarse_mae_global,
+                "mae_improvement_mm": 0.0,
+                "mae_skill": 0.0,
+                "residual_scale": 0.0,
+                "n_dates": len(merged_rows),
+                "n_valid_pixels_total": int(total_pixels_all),
+                "ensemble_members": 1,
+                "num_steps": 0,
+            },
+            {
+                "comparison": "prediction_vs_groundtruth",
+                "mae": model_mae_global,
+                "crps": model_crps_global,
+                "mase": model_mase_global,
+                "scale_mae": coarse_mae_global,
+                "mae_improvement_mm": coarse_mae_global - model_mae_global,
+                "mae_skill": model_mae_skill_global,
+                "residual_scale": residual_scale,
+                "n_dates": len(merged_rows),
+                "n_valid_pixels_total": int(total_pixels_all),
+                "ensemble_members": args.ensemble_members,
+                "num_steps": args.num_steps,
+            },
+        ]
+
+        write_csv(output_csv_path, merged_rows, [
+            "date", "n_valid_pixels", "coarse_mae", "coarse_crps", "coarse_mase",
+            "model_mae", "model_crps", "model_mase", "mae_improvement_mm", "mae_skill",
+            "residual_scale", "ensemble_members", "num_steps",
+        ])
+        write_csv(summary_csv_path, summary_rows, [
+            "comparison", "mae", "crps", "mase", "scale_mae", "n_dates",
+            "mae_improvement_mm", "mae_skill", "residual_scale",
+            "n_valid_pixels_total", "ensemble_members", "num_steps",
+        ])
+
+        print0(f"[Saved] per-date metrics: {args.output_csv}")
+        print0(f"[Saved] summary metrics:  {args.summary_csv}")
+
+    if is_dist_avail_and_initialized():
+        dist.barrier()
+    cleanup_distributed()
+
 
 
 if __name__ == "__main__":

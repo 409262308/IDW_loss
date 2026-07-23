@@ -1,8 +1,9 @@
-import io
+已使用 70% 的儲存空間 … 儲存空間用盡後，就無法建立、編輯和上傳檔案。歡迎與家庭成員共享 100 GB 儲存空間，前 3 個月每月只要 $16.25 $65。
+1
+100%
 import json
 import math
 import re
-import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -15,27 +16,27 @@ import torch.nn.functional as F
 LOW_RES_SHAPE = (14, 9)
 
 PREDICTOR_SPECS = {
-    "q700": ("q700_npy.zip", "q700_npy/q700_{date}.npy"),
-    "t2m": ("t2m_daily_14x9.zip", "t2m_daily_14x9/t2m_{date}.npy"),
-    "u": ("u_npy.zip", "u_npy/u_{date}.npy"),
-    "v": ("v_npy.zip", "v_npy/v_{date}.npy"),
-    "msl": ("msl_npy.zip", "msl_npy/msl_{date}.npy"),
-    "tp": ("ERA5_tp_14x9.zip", "ERA5_tp_14x9/tp_{date}.npy"),
+    "q700": ("q700_npy", "q700_{date}.npy"),
+    "t2m": ("t2m_daily_14x9", "t2m_{date}.npy"),
+    "u": ("u_npy", "u_{date}.npy"),
+    "v": ("v_npy", "v_{date}.npy"),
+    "msl": ("msl_npy", "msl_{date}.npy"),
+    "tp": ("ERA5_tp_14x9", "tp_{date}.npy"),
 }
 
 TARGET_SPECS = {
     "5km": {
-        "zip": "resized_5km.zip",
+        "folder": "resized_5km",
         "shape": (70, 45),
         "padded_shape": (72, 48),
     },
     "8km": {
-        "zip": "resized_8km.zip",
+        "folder": "resized_8km",
         "shape": (112, 72),
         "padded_shape": (112, 72),
     },
     "1km": {
-        "zip": "resized_1km.zip",
+        "folder": "resized_1km",
         "shape": (350, 225),
         "padded_shape": (352, 232),
     },
@@ -57,9 +58,8 @@ def select_evenly_spaced(items, max_items):
     return [items[i] for i in indices]
 
 
-def load_npy_from_zip(zip_file, entry_name):
-    with zip_file.open(entry_name) as handle:
-        return np.load(io.BytesIO(handle.read()), allow_pickle=False)
+def load_npy_from_file(path):
+    return np.load(path, allow_pickle=False)
 
 
 def as_hw_tensor(array, shape):
@@ -203,7 +203,7 @@ class TaiwanERAPrecipDataset(torch.utils.data.Dataset):
         self.stats = stats
         self.tp_idw_k = tp_idw_k
         self.tp_idw_power = tp_idw_power
-        self._zip_handles = None
+        self._file_cache = None
 
         if resolution not in TARGET_SPECS:
             raise ValueError(f"resolution must be one of {sorted(TARGET_SPECS)}.")
@@ -233,7 +233,7 @@ class TaiwanERAPrecipDataset(torch.utils.data.Dataset):
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        state["_zip_handles"] = None
+        state["_file_cache"] = None
         return state
 
     def __len__(self):
@@ -254,55 +254,59 @@ class TaiwanERAPrecipDataset(torch.utils.data.Dataset):
         }
 
     def close(self):
-        if self._zip_handles:
+        if getattr(self, "_zip_handles", None):
             for handle in self._zip_handles.values():
                 handle.close()
-        self._zip_handles = None
+        self._file_cache = None
+
 
     def _collect_dates(self, start_date, end_date):
-        target_zip = self.data_dir / TARGET_SPECS[self.resolution]["zip"]
+        target_folder = self.data_dir / TARGET_SPECS[self.resolution]["folder"]
         start = parse_yyyymmdd(start_date)
         end = parse_yyyymmdd(end_date)
         dates = []
-        with zipfile.ZipFile(target_zip) as zf:
-            for entry in zf.infolist():
-                if entry.is_dir() or not entry.filename.endswith(".npy"):
-                    continue
-                match = re.search(r"(\d{8})\.npy$", entry.filename)
-                if match is None:
-                    continue
-                date = match.group(1)
-                parsed = parse_yyyymmdd(date)
-                if start <= parsed <= end:
-                    dates.append(date)
-                    self._target_entry_by_date[date] = entry.filename
+
+        if not target_folder.exists():
+            raise FileNotFoundError(f"Target folder not found: {target_folder}")
+
+        for path in sorted(target_folder.glob("*.npy")):
+            match = re.search(r"(\d{8})\.npy$", path.name)
+            if match is None:
+                continue
+            date = match.group(1)
+            parsed = parse_yyyymmdd(date)
+            if start <= parsed <= end:
+                dates.append(date)
+                self._target_entry_by_date[date] = str(path)
+
         return sorted(dates)
 
+
     def _required_zip_names(self):
-        names = {TARGET_SPECS[self.resolution]["zip"]}
-        for var in set(self.condition_vars + ["tp"]):
-            names.add(PREDICTOR_SPECS[var][0])
-        return names
+        # Kept for backward compatibility with older training scripts.
+        # Extracted .npy files are now used directly, so no zip files are required.
+        return set()
+
 
     def _ensure_zip_handles(self):
-        if self._zip_handles is None:
-            self._zip_handles = {
-                name: zipfile.ZipFile(self.data_dir / name)
-                for name in self._required_zip_names()
-            }
-        return self._zip_handles
+        # Kept for backward compatibility. This dataset no longer opens zip files.
+        return {}
+
 
     def _load_predictor(self, var, date):
-        zip_name, pattern = PREDICTOR_SPECS[var]
-        zips = self._ensure_zip_handles()
-        array = load_npy_from_zip(zips[zip_name], pattern.format(date=date))
+        folder_name, pattern = PREDICTOR_SPECS[var]
+        path = self.data_dir / folder_name / pattern.format(date=date)
+        if not path.exists():
+            raise FileNotFoundError(f"Predictor file not found: {path}")
+        array = load_npy_from_file(path)
         return as_hw_tensor(array, LOW_RES_SHAPE)
 
+
     def _load_target(self, date):
-        zip_name = TARGET_SPECS[self.resolution]["zip"]
-        zips = self._ensure_zip_handles()
-        entry = self._target_entry_by_date[date]
-        array = load_npy_from_zip(zips[zip_name], entry)
+        path = Path(self._target_entry_by_date[date])
+        if not path.exists():
+            raise FileNotFoundError(f"Target file not found: {path}")
+        array = load_npy_from_file(path)
         return as_hw_tensor(array, self.target_shape)
 
     def _build_valid_mask(self):
