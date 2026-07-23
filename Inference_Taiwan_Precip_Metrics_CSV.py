@@ -10,16 +10,13 @@ Outputs two CSV files without plotting:
   2. summary metrics
 
 Metrics:
-  coarse_vs_groundtruth: MAE, CRPS, MASE
-  prediction_vs_groundtruth: MAE, CRPS, MASE
+  coarse_vs_groundtruth: MAE, RMSE, CRPS
+  prediction_vs_groundtruth: MAE, RMSE, CRPS
 
 Notes:
   - Coarse CRPS is deterministic CRPS, so it equals MAE.
   - Model CRPS uses the empirical ensemble CRPS:
       mean_m |p_m - y| - 0.5 * mean_{m,j} |p_m - p_j|
-  - MASE uses coarse MAE as the scaling baseline:
-      model_mase = model_mae / coarse_mae
-      coarse_mase = 1.0
 
 Expected local files:
   Network.py
@@ -346,13 +343,14 @@ def apply_residual_scale(preds: torch.Tensor, coarse: torch.Tensor, scale: float
 @torch.no_grad()
 def calibrate_residual_scale(
     model, dataset, dataloader, args, candidates: List[float], device
-) -> Tuple[float, List[float], List[float]]:
-    """Choose correction scale by MAE and CRPS on validation data.
+) -> Tuple[float, List[float], List[float], List[float]]:
+    """Choose correction scale by MAE, RMSE, and CRPS on validation data.
 
     Scale zero is the exact coarse forecast, so including it makes the
     calibration result no worse than coarse on the calibration subset.
     """
     abs_sums = torch.zeros(len(candidates), dtype=torch.float64, device=device)
+    squared_sums = torch.zeros(len(candidates), dtype=torch.float64, device=device)
     crps_sums = torch.zeros(len(candidates), dtype=torch.float64, device=device)
     pixel_count = torch.zeros(1, dtype=torch.float64, device=device)
 
@@ -380,26 +378,38 @@ def calibrate_residual_scale(
         for i, scale in enumerate(candidates):
             calibrated_preds = apply_residual_scale(raw_preds, coarse, scale)
             calibrated_mean = calibrated_preds.mean(dim=0)
-            abs_sums[i] += (torch.abs(calibrated_mean - fine) * mask).sum().double().to(device)
+            error = calibrated_mean - fine
+            abs_sums[i] += (torch.abs(error) * mask).sum().double().to(device)
+            squared_sums[i] += (error.square() * mask).sum().double().to(device)
             crps = crps_ensemble_map(calibrated_preds, fine)
             crps_sums[i] += (crps * mask).sum().double().to(device)
 
     if is_dist_avail_and_initialized():
         dist.all_reduce(abs_sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(squared_sums, op=dist.ReduceOp.SUM)
         dist.all_reduce(crps_sums, op=dist.ReduceOp.SUM)
         dist.all_reduce(pixel_count, op=dist.ReduceOp.SUM)
     maes = (abs_sums / pixel_count.clamp_min(1.0)).cpu().tolist()
+    rmses = torch.sqrt(squared_sums / pixel_count.clamp_min(1.0)).cpu().tolist()
     crps_values = (crps_sums / pixel_count.clamp_min(1.0)).cpu().tolist()
     zero_index = candidates.index(0.0)
     tolerance = 1e-10
     eligible = [
         i for i in range(len(candidates))
-        if maes[i] <= maes[zero_index] + tolerance and crps_values[i] <= crps_values[zero_index] + tolerance
+        if (
+            maes[i] <= maes[zero_index] + tolerance
+            and rmses[i] <= rmses[zero_index] + tolerance
+            and crps_values[i] <= crps_values[zero_index] + tolerance
+        )
     ]
-    best_index = min(eligible, key=lambda i: (maes[i], crps_values[i], abs(candidates[i])))
+    best_index = min(
+        eligible,
+        key=lambda i: (maes[i], rmses[i], crps_values[i], abs(candidates[i])),
+    )
     return (
         float(candidates[best_index]),
         [float(v) for v in maes],
+        [float(v) for v in rmses],
         [float(v) for v in crps_values],
     )
 
@@ -416,36 +426,29 @@ def metric_batch(coarse: torch.Tensor, fine: torch.Tensor, preds: torch.Tensor, 
 
     coarse_abs = torch.abs(coarse - fine)
     coarse_mae = masked_mean_by_sample(coarse_abs, valid_mask)
+    coarse_squared = (coarse - fine).square()
+    coarse_rmse = torch.sqrt(masked_mean_by_sample(coarse_squared, valid_mask))
     coarse_crps = coarse_mae.clone()
 
     pred_mean = preds.mean(dim=0)
-    model_abs = torch.abs(pred_mean - fine)
+    model_error = pred_mean - fine
+    model_abs = torch.abs(model_error)
     model_mae = masked_mean_by_sample(model_abs, valid_mask)
+    model_squared = model_error.square()
+    model_rmse = torch.sqrt(masked_mean_by_sample(model_squared, valid_mask))
 
     model_crps_map = crps_ensemble_map(preds, fine)
     model_crps = masked_mean_by_sample(model_crps_map, valid_mask)
 
     rows = []
-    eps = 1e-12
     for b in range(fine.shape[0]):
-        scale = float(coarse_mae[b].item())
-        if scale > eps:
-            coarse_mase = 1.0
-            model_mase = float(model_mae[b].item()) / scale
-            mae_skill = 1.0 - model_mase
-        else:
-            coarse_mase = float("nan")
-            model_mase = float("nan")
-            mae_skill = float("nan")
         rows.append({
             "coarse_mae": float(coarse_mae[b].item()),
+            "coarse_rmse": float(coarse_rmse[b].item()),
             "coarse_crps": float(coarse_crps[b].item()),
-            "coarse_mase": coarse_mase,
             "model_mae": float(model_mae[b].item()),
+            "model_rmse": float(model_rmse[b].item()),
             "model_crps": float(model_crps[b].item()),
-            "model_mase": model_mase,
-            "mae_improvement_mm": float(coarse_mae[b].item() - model_mae[b].item()),
-            "mae_skill": mae_skill,
             "n_valid_pixels": int(valid_mask[b].sum().item()),
         })
 
@@ -453,8 +456,10 @@ def metric_batch(coarse: torch.Tensor, fine: torch.Tensor, preds: torch.Tensor, 
     totals = {
         "n_pixels": float(mask.sum().item()),
         "coarse_abs_sum": float((coarse_abs * mask).sum().item()),
+        "coarse_squared_sum": float((coarse_squared * mask).sum().item()),
         "coarse_crps_sum": float((coarse_abs * mask).sum().item()),
         "model_abs_sum": float((model_abs * mask).sum().item()),
+        "model_squared_sum": float((model_squared * mask).sum().item()),
         "model_crps_sum": float((model_crps_map * mask).sum().item()),
     }
     return rows, totals
@@ -469,7 +474,7 @@ def write_csv(path: Path, rows: List[Dict], fieldnames: List[str]) -> None:
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Taiwan precipitation inference: write MAE/CRPS/MASE to CSV.")
+    parser = argparse.ArgumentParser(description="Taiwan precipitation inference: write MAE/RMSE/CRPS to CSV.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to best.pt or best_full.pt.")
     parser.add_argument("--train-config", type=str, default=None)
     parser.add_argument("--stats-path", type=str, default=None)
@@ -684,13 +689,15 @@ def main() -> None:
             num_workers=args.num_workers,
             pin_memory=torch.cuda.is_available(),
         )
-        residual_scale, calibration_maes, calibration_crps = calibrate_residual_scale(
+        residual_scale, calibration_maes, calibration_rmses, calibration_crps = calibrate_residual_scale(
             model, calibration_dataset, calibration_loader, args, candidates, device
         )
         if is_main_process():
-            print0("[Calibration] scale -> MAE/CRPS: " + ", ".join(
-                f"{scale:g}->{mae:.6f}/{crps:.6f}"
-                for scale, mae, crps in zip(candidates, calibration_maes, calibration_crps)
+            print0("[Calibration] scale -> MAE/RMSE/CRPS: " + ", ".join(
+                f"{scale:g}->{mae:.6f}/{rmse:.6f}/{crps:.6f}"
+                for scale, mae, rmse, crps in zip(
+                    candidates, calibration_maes, calibration_rmses, calibration_crps
+                )
             ))
         calibration_dataset.close()
     else:
@@ -716,8 +723,10 @@ def main() -> None:
     per_date_rows = []
     total_pixels = 0.0
     total_coarse_abs = 0.0
+    total_coarse_squared = 0.0
     total_coarse_crps = 0.0
     total_model_abs = 0.0
+    total_model_squared = 0.0
     total_model_crps = 0.0
 
     for batch_index, batch in enumerate(tqdm(dataloader, desc=f"Inference rank {get_rank()}", dynamic_ncols=True, disable=not is_main_process())):
@@ -756,13 +765,11 @@ def main() -> None:
                 "date": str(date),
                 "n_valid_pixels": row["n_valid_pixels"],
                 "coarse_mae": row["coarse_mae"],
+                "coarse_rmse": row["coarse_rmse"],
                 "coarse_crps": row["coarse_crps"],
-                "coarse_mase": row["coarse_mase"],
                 "model_mae": row["model_mae"],
+                "model_rmse": row["model_rmse"],
                 "model_crps": row["model_crps"],
-                "model_mase": row["model_mase"],
-                "mae_improvement_mm": row["mae_improvement_mm"],
-                "mae_skill": row["mae_skill"],
                 "residual_scale": residual_scale,
                 "ensemble_members": args.ensemble_members,
                 "num_steps": args.num_steps,
@@ -770,8 +777,10 @@ def main() -> None:
 
         total_pixels += totals["n_pixels"]
         total_coarse_abs += totals["coarse_abs_sum"]
+        total_coarse_squared += totals["coarse_squared_sum"]
         total_coarse_crps += totals["coarse_crps_sum"]
         total_model_abs += totals["model_abs_sum"]
+        total_model_squared += totals["model_squared_sum"]
         total_model_crps += totals["model_crps_sum"]
 
     output_csv_path = Path(args.output_csv)
@@ -787,15 +796,17 @@ def main() -> None:
     part_json = part_dir / f"totals_rank{get_rank()}.json"
 
     write_csv(part_csv, per_date_rows, [
-        "date", "n_valid_pixels", "coarse_mae", "coarse_crps", "coarse_mase",
-        "model_mae", "model_crps", "model_mase", "mae_improvement_mm", "mae_skill",
+        "date", "n_valid_pixels", "coarse_mae", "coarse_rmse", "coarse_crps",
+        "model_mae", "model_rmse", "model_crps",
         "residual_scale", "ensemble_members", "num_steps",
     ])
     part_json.write_text(json.dumps({
         "n_pixels": total_pixels,
         "coarse_abs_sum": total_coarse_abs,
+        "coarse_squared_sum": total_coarse_squared,
         "coarse_crps_sum": total_coarse_crps,
         "model_abs_sum": total_model_abs,
+        "model_squared_sum": total_model_squared,
         "model_crps_sum": total_model_crps,
     }, indent=2), encoding="utf-8")
 
@@ -806,8 +817,10 @@ def main() -> None:
         merged_rows = []
         total_pixels_all = 0.0
         total_coarse_abs_all = 0.0
+        total_coarse_squared_all = 0.0
         total_coarse_crps_all = 0.0
         total_model_abs_all = 0.0
+        total_model_squared_all = 0.0
         total_model_crps_all = 0.0
 
         for rank in range(get_world_size()):
@@ -822,30 +835,28 @@ def main() -> None:
             totals = json.loads(rank_json.read_text(encoding="utf-8"))
             total_pixels_all += float(totals["n_pixels"])
             total_coarse_abs_all += float(totals["coarse_abs_sum"])
+            total_coarse_squared_all += float(totals["coarse_squared_sum"])
             total_coarse_crps_all += float(totals["coarse_crps_sum"])
             total_model_abs_all += float(totals["model_abs_sum"])
+            total_model_squared_all += float(totals["model_squared_sum"])
             total_model_crps_all += float(totals["model_crps_sum"])
 
         merged_rows.sort(key=lambda row: row["date"])
 
         eps = 1e-12
         coarse_mae_global = total_coarse_abs_all / max(total_pixels_all, eps)
+        coarse_rmse_global = math.sqrt(total_coarse_squared_all / max(total_pixels_all, eps))
         coarse_crps_global = total_coarse_crps_all / max(total_pixels_all, eps)
         model_mae_global = total_model_abs_all / max(total_pixels_all, eps)
+        model_rmse_global = math.sqrt(total_model_squared_all / max(total_pixels_all, eps))
         model_crps_global = total_model_crps_all / max(total_pixels_all, eps)
-        coarse_mase_global = 1.0 if coarse_mae_global > eps else float("nan")
-        model_mase_global = model_mae_global / coarse_mae_global if coarse_mae_global > eps else float("nan")
-        model_mae_skill_global = 1.0 - model_mase_global if coarse_mae_global > eps else float("nan")
 
         summary_rows = [
             {
                 "comparison": "coarse_vs_groundtruth",
                 "mae": coarse_mae_global,
+                "rmse": coarse_rmse_global,
                 "crps": coarse_crps_global,
-                "mase": coarse_mase_global,
-                "scale_mae": coarse_mae_global,
-                "mae_improvement_mm": 0.0,
-                "mae_skill": 0.0,
                 "residual_scale": 0.0,
                 "n_dates": len(merged_rows),
                 "n_valid_pixels_total": int(total_pixels_all),
@@ -855,11 +866,8 @@ def main() -> None:
             {
                 "comparison": "prediction_vs_groundtruth",
                 "mae": model_mae_global,
+                "rmse": model_rmse_global,
                 "crps": model_crps_global,
-                "mase": model_mase_global,
-                "scale_mae": coarse_mae_global,
-                "mae_improvement_mm": coarse_mae_global - model_mae_global,
-                "mae_skill": model_mae_skill_global,
                 "residual_scale": residual_scale,
                 "n_dates": len(merged_rows),
                 "n_valid_pixels_total": int(total_pixels_all),
@@ -869,13 +877,12 @@ def main() -> None:
         ]
 
         write_csv(output_csv_path, merged_rows, [
-            "date", "n_valid_pixels", "coarse_mae", "coarse_crps", "coarse_mase",
-            "model_mae", "model_crps", "model_mase", "mae_improvement_mm", "mae_skill",
+            "date", "n_valid_pixels", "coarse_mae", "coarse_rmse", "coarse_crps",
+            "model_mae", "model_rmse", "model_crps",
             "residual_scale", "ensemble_members", "num_steps",
         ])
         write_csv(summary_csv_path, summary_rows, [
-            "comparison", "mae", "crps", "mase", "scale_mae", "n_dates",
-            "mae_improvement_mm", "mae_skill", "residual_scale",
+            "comparison", "mae", "rmse", "crps", "residual_scale", "n_dates",
             "n_valid_pixels_total", "ensemble_members", "num_steps",
         ])
 
