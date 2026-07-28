@@ -218,5 +218,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 #avoid by myself
-*.zip
-*.npy
+resized_1km.zip
+resized_5km.zip
+resized_8km.zip
