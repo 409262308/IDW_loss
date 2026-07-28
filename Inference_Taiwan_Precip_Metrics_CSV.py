@@ -5,6 +5,8 @@ Inference_Taiwan_Precip_Metrics_CSV.py
 
 Precipitation inference + CSV metrics for Taiwan IDW diffusion model.
 
+Compatible with best/latest checkpoints produced by the resume-enabled trainer.
+
 Outputs two CSV files without plotting:
   1. per-date metrics
   2. summary metrics
@@ -213,6 +215,54 @@ def load_checkpoint(checkpoint_path: Path, device: torch.device):
             obj.get("val_loss", None),
         )
     return strip_module_prefix(obj), {}, None, None, None
+
+
+def resolve_checkpoint_path(value: str, choice: str = "best") -> Path:
+    """Resolve a checkpoint file or a training output directory.
+
+    When a directory is supplied, final evaluation should normally use
+    ``choice='best'`` so the checkpoint with the lowest validation loss is
+    tested. ``choice='latest'`` is mainly for inspecting the last completed
+    training epoch.
+    """
+    path = Path(value).expanduser()
+    if path.is_file():
+        return path
+
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint path does not exist: {path}")
+    if not path.is_dir():
+        raise ValueError(f"Checkpoint path must be a file or directory: {path}")
+
+    model_dir = path if path.name == "Model" else path / "Model"
+    if not model_dir.is_dir():
+        raise FileNotFoundError(
+            f"Cannot find Model directory below training output: {path}"
+        )
+
+    if choice == "best":
+        candidates = [
+            model_dir / "best_full.pt",
+            model_dir / "best.pt",
+            model_dir / "latest_full.pt",
+            model_dir / "latest.pt",
+        ]
+    elif choice == "latest":
+        candidates = [
+            model_dir / "latest_full.pt",
+            model_dir / "latest.pt",
+            model_dir / "best_full.pt",
+            model_dir / "best.pt",
+        ]
+    else:
+        raise ValueError(f"Unsupported checkpoint choice: {choice}")
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    searched = ", ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(f"No usable checkpoint found. Searched: {searched}")
 
 
 def infer_output_dir_from_checkpoint(checkpoint: Path) -> Optional[Path]:
@@ -475,7 +525,25 @@ def write_csv(path: Path, rows: List[Dict], fieldnames: List[str]) -> None:
 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Taiwan precipitation inference: write MAE/RMSE/CRPS to CSV.")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to best.pt or best_full.pt.")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help=(
+            "Checkpoint file, Model directory, or training output directory. "
+            "A directory is resolved using --checkpoint-choice."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-choice",
+        type=str,
+        default="best",
+        choices=["best", "latest"],
+        help=(
+            "When --checkpoint is a directory, use the best-validation or "
+            "latest-completed checkpoint. Final testing should normally use best."
+        ),
+    )
     parser.add_argument("--train-config", type=str, default=None)
     parser.add_argument("--stats-path", type=str, default=None)
 
@@ -519,6 +587,16 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--calibration-end", type=str, default=None)
     parser.add_argument("--calibration-max-samples", type=int, default=256)
     parser.add_argument("--calibration-ensemble-members", type=int, default=4)
+    parser.add_argument(
+        "--calibration-csv",
+        type=str,
+        default=None,
+        help=(
+            "Optional CSV containing every residual-scale candidate and its "
+            "validation MAE/RMSE/CRPS. When omitted in auto mode, a file is "
+            "created beside --summary-csv."
+        ),
+    )
 
     parser.add_argument("--output-csv", type=str, default="./precip_metrics_per_date.csv")
     parser.add_argument("--summary-csv", type=str, default="./precip_metrics_summary.csv")
@@ -528,7 +606,7 @@ def build_argparser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_argparser().parse_args()
 
-    checkpoint_path = Path(args.checkpoint)
+    checkpoint_path = resolve_checkpoint_path(args.checkpoint, args.checkpoint_choice)
     device = setup_distributed(args)
     set_seed(args.seed + get_rank())
     state_dict, ckpt_config, ckpt_stats, epoch, val_loss = load_checkpoint(checkpoint_path, device)
@@ -652,6 +730,7 @@ def main() -> None:
     if args.ensemble_members < 1 or args.num_steps < 2:
         raise ValueError("--ensemble-members must be >= 1 and --num-steps must be >= 2.")
 
+    calibration_rows = None
     if args.residual_scale.lower() == "auto":
         calibration_start = args.calibration_start or merged_config.get("val_start")
         calibration_end = args.calibration_end or merged_config.get("val_end")
@@ -692,6 +771,26 @@ def main() -> None:
         residual_scale, calibration_maes, calibration_rmses, calibration_crps = calibrate_residual_scale(
             model, calibration_dataset, calibration_loader, args, candidates, device
         )
+        zero_index = candidates.index(0.0)
+        tolerance = 1e-10
+        calibration_rows = []
+        for scale, mae, rmse, crps in zip(
+            candidates, calibration_maes, calibration_rmses, calibration_crps
+        ):
+            eligible = (
+                mae <= calibration_maes[zero_index] + tolerance
+                and rmse <= calibration_rmses[zero_index] + tolerance
+                and crps <= calibration_crps[zero_index] + tolerance
+            )
+            calibration_rows.append({
+                "scale": scale,
+                "mae": mae,
+                "rmse": rmse,
+                "crps": crps,
+                "eligible_vs_coarse": int(eligible),
+                "selected": int(math.isclose(scale, residual_scale, rel_tol=0.0, abs_tol=1e-12)),
+            })
+
         if is_main_process():
             print0("[Calibration] scale -> MAE/RMSE/CRPS: " + ", ".join(
                 f"{scale:g}->{mae:.6f}/{rmse:.6f}/{crps:.6f}"
@@ -699,6 +798,19 @@ def main() -> None:
                     candidates, calibration_maes, calibration_rmses, calibration_crps
                 )
             ))
+            calibration_csv_path = (
+                Path(args.calibration_csv)
+                if args.calibration_csv
+                else Path(args.summary_csv).with_name(
+                    Path(args.summary_csv).stem + "_calibration.csv"
+                )
+            )
+            write_csv(
+                calibration_csv_path,
+                calibration_rows,
+                ["scale", "mae", "rmse", "crps", "eligible_vs_coarse", "selected"],
+            )
+            print0(f"[Saved] calibration metrics: {calibration_csv_path}")
         calibration_dataset.close()
     else:
         residual_scale = float(args.residual_scale)
@@ -706,7 +818,7 @@ def main() -> None:
             raise ValueError("--residual-scale must be non-negative.")
 
     print0(f"[Device] {device}")
-    print0(f"[Checkpoint] {checkpoint_path}")
+    print0(f"[Checkpoint] resolved={checkpoint_path} choice={args.checkpoint_choice}")
     if epoch is not None:
         print0(f"[Checkpoint] epoch={epoch} val_loss={val_loss}")
     print0(f"[Dataset] test={len(dataset_test)} resolution={args.resolution}")
@@ -785,7 +897,7 @@ def main() -> None:
 
     output_csv_path = Path(args.output_csv)
     summary_csv_path = Path(args.summary_csv)
-    part_dir = output_csv_path.parent / "_ddp_inference_parts"
+    part_dir = output_csv_path.parent / f"_{output_csv_path.stem}_ddp_parts"
 
     if is_main_process():
         part_dir.mkdir(parents=True, exist_ok=True)
@@ -862,6 +974,9 @@ def main() -> None:
                 "n_valid_pixels_total": int(total_pixels_all),
                 "ensemble_members": 1,
                 "num_steps": 0,
+                "checkpoint": checkpoint_path.name,
+                "checkpoint_epoch": "" if epoch is None else epoch,
+                "checkpoint_val_loss": "" if val_loss is None else val_loss,
             },
             {
                 "comparison": "prediction_vs_groundtruth",
@@ -873,6 +988,9 @@ def main() -> None:
                 "n_valid_pixels_total": int(total_pixels_all),
                 "ensemble_members": args.ensemble_members,
                 "num_steps": args.num_steps,
+                "checkpoint": checkpoint_path.name,
+                "checkpoint_epoch": "" if epoch is None else epoch,
+                "checkpoint_val_loss": "" if val_loss is None else val_loss,
             },
         ]
 
@@ -884,6 +1002,7 @@ def main() -> None:
         write_csv(summary_csv_path, summary_rows, [
             "comparison", "mae", "rmse", "crps", "residual_scale", "n_dates",
             "n_valid_pixels_total", "ensemble_members", "num_steps",
+            "checkpoint", "checkpoint_epoch", "checkpoint_val_loss",
         ])
 
         print0(f"[Saved] per-date metrics: {args.output_csv}")

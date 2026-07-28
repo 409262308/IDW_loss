@@ -34,6 +34,13 @@ Important:
         effective raw batch per optimizer step = 16 * 4 = 64
         if --accum 8:
         effective accumulated batch = 16 * 4 * 8 = 512
+
+Resume:
+    The script saves Model/latest_full.pt after every completed epoch.
+    Use --resume auto to continue from latest_full.pt (falling back to best_full.pt),
+    or pass an explicit full-checkpoint path. --epochs is the TOTAL target epoch
+    count, not the number of extra epochs. For example, if epoch 59 is saved,
+    --epochs 80 resumes at epoch 60 and trains through epoch 79.
 """
 
 # + language="bash"
@@ -591,6 +598,140 @@ def sample_model(model, dataloader, num_steps, sigma_min, sigma_max, rho, S_chur
     return (fig, ax), (base_error.item(), pred_error.item())
 
 
+
+def load_full_checkpoint(path: Path, device: torch.device):
+    """Load a resumable checkpoint on every rank.
+
+    A resumable checkpoint must contain model_state_dict and epoch. Plain
+    best.pt files contain weights only and are intentionally rejected because
+    they cannot restore optimizer progress or the epoch counter.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Resume checkpoint not found: {path}")
+
+    try:
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        # Compatibility with PyTorch versions that do not expose weights_only.
+        checkpoint = torch.load(path, map_location=device)
+
+    if not isinstance(checkpoint, dict):
+        raise ValueError(
+            f"Resume checkpoint must be a full checkpoint dict, got {type(checkpoint).__name__}."
+        )
+    if "model_state_dict" not in checkpoint or "epoch" not in checkpoint:
+        raise ValueError(
+            f"{path} is not a resumable full checkpoint. Use latest_full.pt or "
+            "best_full.pt, not best.pt."
+        )
+    return checkpoint
+
+
+def resolve_resume_path(resume_arg: Optional[str], model_dir: Path) -> Optional[Path]:
+    """Resolve --resume; 'auto' prefers latest_full.pt then best_full.pt."""
+    if resume_arg is None:
+        return None
+
+    value = str(resume_arg).strip()
+    if not value:
+        return None
+
+    if value.lower() == "auto":
+        latest = model_dir / "latest_full.pt"
+        best = model_dir / "best_full.pt"
+        if latest.exists():
+            return latest
+        if best.exists():
+            return best
+        raise FileNotFoundError(
+            f"--resume auto could not find {latest} or {best}."
+        )
+
+    return Path(value).expanduser()
+
+
+def load_loss_history(path: Path, completed_epoch: int):
+    """Load and truncate losses.json so resumed epochs are not duplicated."""
+    if not path.exists():
+        return []
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(rows, list):
+        return []
+    return [
+        row for row in rows
+        if isinstance(row, dict) and int(row.get("epoch", -1)) <= completed_epoch
+    ]
+
+
+def validate_resume_configuration(checkpoint_config, args):
+    """Reject data/model-shape changes that would invalidate a continuation."""
+    if not isinstance(checkpoint_config, dict):
+        return
+
+    current = {
+        "resolution": args.resolution,
+        "condition_vars": args.condition_vars,
+        "no_mask": args.no_mask,
+        "target_transform": args.target_transform,
+        "tp_idw_k": args.tp_idw_k,
+        "tp_idw_power": args.tp_idw_power,
+        "model_channels": args.model_channels,
+        "channel_mult": args.channel_mult,
+        "num_blocks": args.num_blocks,
+        "attn_resolutions": args.attn_resolutions,
+    }
+
+    mismatches = []
+    for key, current_value in current.items():
+        if key not in checkpoint_config:
+            continue
+        saved_value = checkpoint_config[key]
+        if key == "tp_idw_power":
+            same = math.isclose(
+                float(saved_value), float(current_value), rel_tol=0.0, abs_tol=1e-12
+            )
+        else:
+            same = saved_value == current_value
+        if not same:
+            mismatches.append(f"{key}: checkpoint={saved_value!r}, current={current_value!r}")
+
+    if mismatches:
+        raise ValueError(
+            "Resume configuration mismatch. These data/model settings must stay "
+            "unchanged:\n  - " + "\n  - ".join(mismatches)
+        )
+
+
+def make_checkpoint_payload(
+    epoch,
+    network,
+    optimiser,
+    scaler,
+    train_loss,
+    val_loss,
+    best_val_loss,
+    config,
+    stats,
+    losses,
+):
+    net_to_save = network.module if isinstance(network, DDP) else network
+    return {
+        "epoch": int(epoch),
+        "model_state_dict": net_to_save.state_dict(),
+        "optimiser_state_dict": optimiser.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "train_loss": float(train_loss),
+        "val_loss": float(val_loss),
+        "best_val_loss": float(best_val_loss),
+        "config": config,
+        "stats": stats,
+        "losses": losses,
+    }
+
+
 def build_argparser():
     parser = argparse.ArgumentParser(description="DDP train Taiwan precipitation EDM diffusion with IDW tp and precipitation-aware loss.")
 
@@ -622,6 +763,23 @@ def build_argparser():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--output-dir", type=str, default="./outputs_taiwan_idw_precip_loss_ddp")
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help=(
+            "Resume from latest_full.pt/best_full.pt. Pass 'auto' to search "
+            "inside OUTPUT_DIR/Model, or pass an explicit full-checkpoint path."
+        ),
+    )
+    parser.add_argument(
+        "--resume-reset-optimizer",
+        action="store_true",
+        help=(
+            "Load model weights and epoch from --resume but start with a fresh "
+            "AdamW optimizer and GradScaler. By default both are restored."
+        ),
+    )
     parser.add_argument("--sample-every", type=int, default=5)
     parser.add_argument("--sample-steps", type=int, default=20)
 
@@ -679,8 +837,37 @@ def main():
     if is_dist_avail_and_initialized():
         dist.barrier()
 
+    resume_path = resolve_resume_path(args.resume, model_dir)
+    resume_checkpoint = None
+    if resume_path is not None:
+        if args.recompute_stats:
+            raise ValueError(
+                "Do not use --recompute-stats while resuming. A resumed model must "
+                "use the same normalization statistics as its checkpoint."
+            )
+        resume_checkpoint = load_full_checkpoint(resume_path, device)
+        validate_resume_configuration(resume_checkpoint.get("config", {}), args)
+        print0(f"[Resume] Full checkpoint: {resume_path}")
+
     if args.stats_path is None:
-        args.stats_path = str(output_dir / f"stats_{args.resolution}.json")
+        default_stats_path = output_dir / f"stats_{args.resolution}.json"
+        checkpoint_stats_path = None
+        if resume_checkpoint is not None:
+            checkpoint_stats_path = resume_checkpoint.get("config", {}).get("stats_path")
+
+        if default_stats_path.exists():
+            args.stats_path = str(default_stats_path)
+        elif checkpoint_stats_path and Path(checkpoint_stats_path).exists():
+            args.stats_path = str(checkpoint_stats_path)
+        elif resume_checkpoint is not None and resume_checkpoint.get("stats") is not None:
+            # This also supports resuming into a new output directory.
+            args.stats_path = str(default_stats_path)
+            if is_main_process():
+                save_stats(resume_checkpoint["stats"], default_stats_path)
+            if is_dist_avail_and_initialized():
+                dist.barrier()
+        else:
+            args.stats_path = str(default_stats_path)
 
     condition_vars = parse_csv_list(args.condition_vars, str)
     channel_mult = parse_csv_list(args.channel_mult, int)
@@ -714,6 +901,14 @@ def main():
         dist.barrier()
 
     stats = load_stats(stats_path)
+    if resume_checkpoint is not None and resume_checkpoint.get("stats") is not None:
+        if stats != resume_checkpoint["stats"]:
+            raise ValueError(
+                "The loaded stats file does not exactly match the normalization "
+                "statistics stored in the resume checkpoint. Resume with the original "
+                "stats file or omit --stats-path so it can be restored automatically."
+            )
+
     expected_spatial_mask = "full_grid" if args.no_mask else "land"
     if stats.get("spatial_mask") != expected_spatial_mask:
         raise ValueError(
@@ -819,7 +1014,6 @@ def main():
 
     optimiser = torch.optim.AdamW(network.parameters(), lr=args.lr)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
-    writer = SummaryWriter(str(run_dir)) if is_main_process() else None
 
     loss_fn = PrecipitationEDMLoss(
         P_mean=args.P_mean,
@@ -850,13 +1044,82 @@ def main():
         "effective_batch": args.batch_size * get_world_size() * args.accum,
     })
 
-    if is_main_process():
-        (output_dir / "train_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
-
+    start_epoch = 0
     best_val_loss = float("inf")
     losses = []
 
-    for epoch in range(args.epochs):
+    if resume_checkpoint is not None:
+        net_to_load = network.module if isinstance(network, DDP) else network
+        net_to_load.load_state_dict(resume_checkpoint["model_state_dict"], strict=True)
+
+        if not args.resume_reset_optimizer:
+            optimiser_state = resume_checkpoint.get("optimiser_state_dict")
+            if optimiser_state is None:
+                raise ValueError(
+                    "The resume checkpoint has no optimiser_state_dict. Either use "
+                    "--resume-reset-optimizer or resume from a newer full checkpoint."
+                )
+            optimiser.load_state_dict(optimiser_state)
+
+            scaler_state = resume_checkpoint.get("scaler_state_dict")
+            if scaler_state is not None:
+                scaler.load_state_dict(scaler_state)
+            else:
+                print0(
+                    "[Resume] Checkpoint has no GradScaler state; continuing with a "
+                    "fresh scaler (compatible with older best_full.pt files)."
+                )
+
+            # The current CLI learning rate intentionally overrides the saved LR,
+            # allowing a lower LR for fine-tuning while preserving Adam moments.
+            for param_group in optimiser.param_groups:
+                param_group["lr"] = args.lr
+
+        completed_epoch = int(resume_checkpoint["epoch"])
+        start_epoch = completed_epoch + 1
+        best_val_loss = float(
+            resume_checkpoint.get(
+                "best_val_loss",
+                resume_checkpoint.get("val_loss", float("inf")),
+            )
+        )
+
+        checkpoint_losses = resume_checkpoint.get("losses")
+        if isinstance(checkpoint_losses, list):
+            losses = [
+                row for row in checkpoint_losses
+                if isinstance(row, dict) and int(row.get("epoch", -1)) <= completed_epoch
+            ]
+        elif is_main_process():
+            losses = load_loss_history(output_dir / "losses.json", completed_epoch)
+
+        # Match the seed that the uninterrupted run would use at the next epoch.
+        seed_everything(args.seed + start_epoch, get_rank())
+        print0(
+            f"[Resume] completed_epoch={completed_epoch}, start_epoch={start_epoch}, "
+            f"best_val_loss={best_val_loss:.6f}, lr={args.lr:g}, "
+            f"reset_optimizer={args.resume_reset_optimizer}"
+        )
+
+    if start_epoch >= args.epochs:
+        raise ValueError(
+            f"Nothing to train: checkpoint resumes at epoch {start_epoch}, but "
+            f"--epochs={args.epochs}. --epochs is the total target count; set it "
+            f"to a value greater than {start_epoch}."
+        )
+
+    config.update({
+        "resume_from": str(resume_path) if resume_path is not None else None,
+        "start_epoch": start_epoch,
+        "epochs_semantics": "total_target_epochs",
+    })
+
+    if is_main_process():
+        (output_dir / "train_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+    writer = SummaryWriter(str(run_dir)) if is_main_process() else None
+
+    for epoch in range(start_epoch, args.epochs):
         if isinstance(dataloader_train.sampler, DistributedSampler):
             dataloader_train.sampler.set_epoch(epoch)
         if isinstance(dataloader_val.sampler, DistributedSampler):
@@ -904,22 +1167,32 @@ def main():
                 except Exception as exc:
                     print0(f"[Warning] sample_model failed at epoch {epoch}: {exc}")
 
-            if val_loss < best_val_loss:
+            is_new_best = val_loss < best_val_loss
+            if is_new_best:
                 best_val_loss = val_loss
-                net_to_save = network.module if isinstance(network, DDP) else network
+
+            checkpoint_payload = make_checkpoint_payload(
+                epoch=epoch,
+                network=network,
+                optimiser=optimiser,
+                scaler=scaler,
+                train_loss=train_loss,
+                val_loss=val_loss,
+                best_val_loss=best_val_loss,
+                config=config,
+                stats=stats,
+                losses=losses,
+            )
+            net_to_save = network.module if isinstance(network, DDP) else network
+
+            # Always save the most recently completed epoch for interruption-safe resume.
+            torch.save(net_to_save.state_dict(), model_dir / "latest.pt")
+            torch.save(checkpoint_payload, model_dir / "latest_full.pt")
+            print0(f"[Checkpoint] Saved latest_full.pt at epoch={epoch}")
+
+            if is_new_best:
                 torch.save(net_to_save.state_dict(), model_dir / "best.pt")
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "model_state_dict": net_to_save.state_dict(),
-                        "optimiser_state_dict": optimiser.state_dict(),
-                        "train_loss": train_loss,
-                        "val_loss": val_loss,
-                        "config": config,
-                        "stats": stats,
-                    },
-                    model_dir / "best_full.pt",
-                )
+                torch.save(checkpoint_payload, model_dir / "best_full.pt")
                 print0(f"[Checkpoint] Saved best.pt with val_loss={best_val_loss:.6f}")
 
             (output_dir / "losses.json").write_text(json.dumps(losses, indent=2), encoding="utf-8")
