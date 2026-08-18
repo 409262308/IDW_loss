@@ -1,8 +1,6 @@
-import io
 import json
 import math
 import re
-import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -15,27 +13,27 @@ import torch.nn.functional as F
 LOW_RES_SHAPE = (14, 9)
 
 PREDICTOR_SPECS = {
-    "q700": ("q700_npy.zip", "q700_npy/q700_{date}.npy"),
-    "t2m": ("t2m_daily_14x9.zip", "t2m_daily_14x9/t2m_{date}.npy"),
-    "u": ("u_npy.zip", "u_npy/u_{date}.npy"),
-    "v": ("v_npy.zip", "v_npy/v_{date}.npy"),
-    "msl": ("msl_npy.zip", "msl_npy/msl_{date}.npy"),
-    "tp": ("ERA5_tp_14x9.zip", "ERA5_tp_14x9/tp_{date}.npy"),
+    "q700": ("q700_npy", "q700_{date}.npy"),
+    "t2m": ("t2m_daily_14x9", "t2m_{date}.npy"),
+    "u": ("u_npy", "u_{date}.npy"),
+    "v": ("v_npy", "v_{date}.npy"),
+    "msl": ("msl_npy", "msl_{date}.npy"),
+    "tp": ("ERA5_tp_14x9", "tp_{date}.npy"),
 }
 
 TARGET_SPECS = {
     "5km": {
-        "zip": "resized_5km.zip",
+        "folder": "resized_5km",
         "shape": (70, 45),
         "padded_shape": (72, 48),
     },
     "8km": {
-        "zip": "resized_8km.zip",
+        "folder": "resized_8km",
         "shape": (112, 72),
         "padded_shape": (112, 72),
     },
     "1km": {
-        "zip": "resized_1km.zip",
+        "folder": "resized_1km",
         "shape": (350, 225),
         "padded_shape": (352, 232),
     },
@@ -57,9 +55,8 @@ def select_evenly_spaced(items, max_items):
     return [items[i] for i in indices]
 
 
-def load_npy_from_zip(zip_file, entry_name):
-    with zip_file.open(entry_name) as handle:
-        return np.load(io.BytesIO(handle.read()), allow_pickle=False)
+def load_npy_from_file(path):
+    return np.load(path, allow_pickle=False)
 
 
 def as_hw_tensor(array, shape):
@@ -75,82 +72,10 @@ def resize_2d(tensor, out_shape, mode="bilinear"):
     return y[0, 0]
 
 
-_IDW_CACHE = {}
-
-
-def _precompute_idw_weights(source_shape, target_shape, k=8, power=2.0, eps=1e-12):
-    """Precompute regular-grid IDW indices and weights.
-
-    Coordinates are normalized to [0, 1] in both directions, so this works when
-    the low-resolution and high-resolution arrays cover the same Taiwan domain.
-    """
-    source_shape = tuple(source_shape)
-    target_shape = tuple(target_shape)
-    key = (source_shape, target_shape, int(k), float(power))
-    if key in _IDW_CACHE:
-        return _IDW_CACHE[key]
-
-    src_h, src_w = source_shape
-    tgt_h, tgt_w = target_shape
-    k = min(int(k), src_h * src_w)
-
-    src_r = np.linspace(0.0, 1.0, src_h, dtype=np.float64)
-    src_c = np.linspace(0.0, 1.0, src_w, dtype=np.float64)
-    tgt_r = np.linspace(0.0, 1.0, tgt_h, dtype=np.float64)
-    tgt_c = np.linspace(0.0, 1.0, tgt_w, dtype=np.float64)
-
-    src_R, src_C = np.meshgrid(src_r, src_c, indexing="ij")
-    tgt_R, tgt_C = np.meshgrid(tgt_r, tgt_c, indexing="ij")
-
-    src_points = np.stack([src_R.reshape(-1), src_C.reshape(-1)], axis=1)
-    tgt_points = np.stack([tgt_R.reshape(-1), tgt_C.reshape(-1)], axis=1)
-
-    dist2 = np.sum((tgt_points[:, None, :] - src_points[None, :, :]) ** 2, axis=2)
-    indices = np.argpartition(dist2, kth=k - 1, axis=1)[:, :k]
-    selected_d2 = np.take_along_axis(dist2, indices, axis=1)
-
-    exact = selected_d2 < eps
-    weights = np.zeros_like(selected_d2, dtype=np.float64)
-
-    has_exact = np.any(exact, axis=1)
-    weights[exact] = 1.0
-
-    non_exact = ~has_exact
-    dist = np.sqrt(selected_d2[non_exact]) + eps
-    w = 1.0 / (dist ** float(power))
-    w = w / np.sum(w, axis=1, keepdims=True)
-    weights[non_exact] = w
-
-    indices = indices.astype(np.int64)
-    weights = weights.astype(np.float32)
-    _IDW_CACHE[key] = (indices, weights)
-    return indices, weights
-
-
-def resize_2d_idw(tensor, out_shape, k=8, power=2.0):
-    """Resize a 2D regular-grid tensor using inverse distance weighting.
-
-    This is used only for coarse precipitation tp. Other predictors still use
-    resize_2d(..., mode="bilinear").
-    """
-    if tuple(tensor.shape) == tuple(out_shape):
-        return tensor
-
-    indices_np, weights_np = _precompute_idw_weights(
-        tuple(tensor.shape),
-        tuple(out_shape),
-        k=k,
-        power=power,
-    )
-
-    indices = torch.as_tensor(indices_np, dtype=torch.long, device=tensor.device)
-    weights = torch.as_tensor(weights_np, dtype=tensor.dtype, device=tensor.device)
-
-    flat = tensor.reshape(-1)
-    values = flat[indices]
-    out = (values * weights).sum(dim=1).reshape(out_shape)
-    return out
-
+# Precipitation and all other dynamic predictors are resized with bilinear
+# interpolation.  The legacy tp_idw_k/tp_idw_power arguments are retained in
+# TaiwanERAPrecipDataset.__init__ only so the existing training/inference CLI
+# remains compatible; they are not used by the dataset.
 
 def pad_hw(tensor, padded_shape):
     pad_h = padded_shape[0] - tensor.shape[-2]
@@ -179,7 +104,11 @@ def inverse_transform_precip(tensor, transform):
 
 
 class TaiwanERAPrecipDataset(torch.utils.data.Dataset):
-    """Daily Taiwan ERA predictors paired with high-resolution precipitation targets."""
+    """Daily Taiwan ERA predictors paired with high-resolution precipitation targets.
+
+    All low-resolution dynamic predictors, including precipitation ``tp``, are
+    resized to the target grid using bilinear interpolation.
+    """
 
     def __init__(
         self,
@@ -201,9 +130,12 @@ class TaiwanERAPrecipDataset(torch.utils.data.Dataset):
         self.use_mask = use_mask
         self.target_transform = target_transform
         self.stats = stats
+        # Legacy compatibility only. Precipitation is resized with bilinear
+        # interpolation, so these IDW parameters are intentionally unused.
         self.tp_idw_k = tp_idw_k
         self.tp_idw_power = tp_idw_power
-        self._zip_handles = None
+        self.tp_resize = "bilinear"
+        self._file_cache = None
 
         if resolution not in TARGET_SPECS:
             raise ValueError(f"resolution must be one of {sorted(TARGET_SPECS)}.")
@@ -228,12 +160,12 @@ class TaiwanERAPrecipDataset(torch.utils.data.Dataset):
         if not self.dates:
             raise ValueError("No dates found for the requested range.")
 
-        self.valid_mask = self._build_valid_mask()
         self.static_mask = self._load_static_mask() if use_mask else None
+        self.valid_mask = self._build_valid_mask()
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        state["_zip_handles"] = None
+        state["_file_cache"] = None
         return state
 
     def __len__(self):
@@ -254,66 +186,81 @@ class TaiwanERAPrecipDataset(torch.utils.data.Dataset):
         }
 
     def close(self):
-        if self._zip_handles:
+        if getattr(self, "_zip_handles", None):
             for handle in self._zip_handles.values():
                 handle.close()
-        self._zip_handles = None
+        self._file_cache = None
+
 
     def _collect_dates(self, start_date, end_date):
-        target_zip = self.data_dir / TARGET_SPECS[self.resolution]["zip"]
+        target_folder = self.data_dir / TARGET_SPECS[self.resolution]["folder"]
         start = parse_yyyymmdd(start_date)
         end = parse_yyyymmdd(end_date)
         dates = []
-        with zipfile.ZipFile(target_zip) as zf:
-            for entry in zf.infolist():
-                if entry.is_dir() or not entry.filename.endswith(".npy"):
-                    continue
-                match = re.search(r"(\d{8})\.npy$", entry.filename)
-                if match is None:
-                    continue
-                date = match.group(1)
-                parsed = parse_yyyymmdd(date)
-                if start <= parsed <= end:
-                    dates.append(date)
-                    self._target_entry_by_date[date] = entry.filename
+
+        if not target_folder.exists():
+            raise FileNotFoundError(f"Target folder not found: {target_folder}")
+
+        for path in sorted(target_folder.glob("*.npy")):
+            match = re.search(r"(\d{8})\.npy$", path.name)
+            if match is None:
+                continue
+            date = match.group(1)
+            parsed = parse_yyyymmdd(date)
+            if start <= parsed <= end:
+                dates.append(date)
+                self._target_entry_by_date[date] = str(path)
+
         return sorted(dates)
 
+
     def _required_zip_names(self):
-        names = {TARGET_SPECS[self.resolution]["zip"]}
-        for var in set(self.condition_vars + ["tp"]):
-            names.add(PREDICTOR_SPECS[var][0])
-        return names
+        # Kept for backward compatibility with older training scripts.
+        # Extracted .npy files are now used directly, so no zip files are required.
+        return set()
+
 
     def _ensure_zip_handles(self):
-        if self._zip_handles is None:
-            self._zip_handles = {
-                name: zipfile.ZipFile(self.data_dir / name)
-                for name in self._required_zip_names()
-            }
-        return self._zip_handles
+        # Kept for backward compatibility. This dataset no longer opens zip files.
+        return {}
+
 
     def _load_predictor(self, var, date):
-        zip_name, pattern = PREDICTOR_SPECS[var]
-        zips = self._ensure_zip_handles()
-        array = load_npy_from_zip(zips[zip_name], pattern.format(date=date))
+        folder_name, pattern = PREDICTOR_SPECS[var]
+        path = self.data_dir / folder_name / pattern.format(date=date)
+        if not path.exists():
+            raise FileNotFoundError(f"Predictor file not found: {path}")
+        array = load_npy_from_file(path)
         return as_hw_tensor(array, LOW_RES_SHAPE)
 
+
     def _load_target(self, date):
-        zip_name = TARGET_SPECS[self.resolution]["zip"]
-        zips = self._ensure_zip_handles()
-        entry = self._target_entry_by_date[date]
-        array = load_npy_from_zip(zips[zip_name], entry)
+        path = Path(self._target_entry_by_date[date])
+        if not path.exists():
+            raise FileNotFoundError(f"Target file not found: {path}")
+        array = load_npy_from_file(path)
         return as_hw_tensor(array, self.target_shape)
 
     def _build_valid_mask(self):
+        # For Taiwan precipitation, train and evaluate only where the static
+        # land mask is valid.  This prevents the nearly-always-zero ocean area
+        # from dominating loss/MAE/CRPS.  --no-mask keeps the legacy full-grid
+        # behaviour.
+        if self.static_mask is not None:
+            return self.static_mask.unsqueeze(0)
         mask = torch.ones(self.target_shape, dtype=torch.float32)
         return pad_hw(mask, self.padded_shape).unsqueeze(0)
 
     def _load_static_mask(self):
         mask_path = self.data_dir / "mask_sd5km.npy"
+        if not mask_path.exists():
+            raise FileNotFoundError(f"Static mask not found: {mask_path}")
         mask = torch.from_numpy(np.load(mask_path, allow_pickle=False)).float()
+        if mask.ndim != 2:
+            raise ValueError(f"Static mask must be 2D, got shape {tuple(mask.shape)}.")
         if tuple(mask.shape) != self.target_shape:
             mask = resize_2d(mask, self.target_shape, mode="nearest")
+        mask = (mask > 0.5).to(torch.float32)
         return pad_hw(mask, self.padded_shape)
 
     def _normalize_input_channel(self, name, tensor):
@@ -344,11 +291,10 @@ class TaiwanERAPrecipDataset(torch.utils.data.Dataset):
 
     def _build_sample(self, date):
         coarse_tp = self._load_predictor("tp", date)
-        coarse_tp_up = resize_2d_idw(
+        coarse_tp_up = resize_2d(
             coarse_tp,
             self.target_shape,
-            k=self.tp_idw_k,
-            power=self.tp_idw_power,
+            mode="bilinear",
         )
         coarse_tp_up = pad_hw(coarse_tp_up, self.padded_shape)
 
@@ -359,11 +305,10 @@ class TaiwanERAPrecipDataset(torch.utils.data.Dataset):
         for var in self.condition_vars:
             low = self._load_predictor(var, date)
             if var == "tp":
-                high = resize_2d_idw(
+                high = resize_2d(
                     low,
                     self.target_shape,
-                    k=self.tp_idw_k,
-                    power=self.tp_idw_power,
+                    mode="bilinear",
                 )
                 high = pad_hw(high, self.padded_shape)
                 high = transform_precip(high, self.target_transform)
@@ -464,9 +409,13 @@ def compute_stats(dataset, max_samples=2048):
     return {
         "resolution": dataset.resolution,
         "target_transform": dataset.target_transform,
-        "tp_resize": "idw",
+        "spatial_mask": "land" if dataset.use_mask else "full_grid",
+        "tp_resize": "bilinear",
+        # Kept only for compatibility with the current training/inference
+        # configuration checks. These values do not affect interpolation.
         "tp_idw_k": dataset.tp_idw_k,
         "tp_idw_power": dataset.tp_idw_power,
+        "tp_idw_parameters_used": False,
         "num_stat_samples": len(dates),
         "input_channels": dataset.input_channel_names,
         "input_mean": input_mean,
