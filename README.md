@@ -1,4 +1,5 @@
 ```text
+paper name：Timestep-aware Multi-scale Explainability for Conditional Diffusion U-Nets in Scientific Field Generation
 「首先介紹我們的研究動機與解決的痛點：
 
 第一個痛點（傳統 AI 的過度平滑）：傳統用 CNN 或 MSE Loss 做降水降尺度的模型，因為 MSE 喜歡取平均，導致畫出來的降水圖會『過度平滑』，完全抹平了颱風或午後雷雨這種局部劇烈降雨的峰值。
